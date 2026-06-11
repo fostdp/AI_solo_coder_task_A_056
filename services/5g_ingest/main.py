@@ -1,22 +1,22 @@
-import logging
-import sys
 import hashlib
 import json
+import time
 import numpy as np
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config import settings
+from shared.logger_setup import setup_logging
 from shared.schemas import VibrationDataBatch, ThermalImageData, DataIngestResponse
 from shared.redis_client import get_redis, close_redis, xadd_msg, ensure_group
 from shared.database import AsyncSessionLocal, test_connection
+from shared import metrics as m
+from shared.metrics import metrics_endpoint
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [INGEST] %(levelname)s: %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = setup_logging("5g_ingest")
 
 SURFACE_MAP = {
     f"VB-{i:03d}": f"C096-{'N' if i<10 else 'S' if i<20 else 'E' if i<28 else 'W' if i<36 else 'C'}"
@@ -43,9 +43,25 @@ app = FastAPI(title="5G Data Ingest Service", version="2.0.0", lifespan=lifespan
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start
+    m.API_REQUEST_DURATION.labels(
+        "5g_ingest", request.method, request.url.path, str(response.status_code)
+    ).observe(duration)
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"service": "5g_ingest", "status": "running"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return metrics_endpoint()
 
 
 @app.post("/ingest/vibration", response_model=DataIngestResponse)
@@ -96,6 +112,7 @@ async def ingest_vibration(batch: VibrationDataBatch):
             await db.rollback()
 
     logger.info(f"振动数据接入: {count}传感器 → Redis+DB")
+    m.VIBRATION_BATCHES_INGESTED.labels("5g_ingest").inc(count)
     return DataIngestResponse(
         success=True,
         message=f"成功存储 {count} 个传感器的振动数据",
@@ -139,6 +156,7 @@ async def ingest_thermal(image: ThermalImageData):
             logger.error(f"热成像DB写入失败: {e}")
             await db.rollback()
 
+    m.THERMAL_IMAGES_INGESTED.labels("5g_ingest").inc()
     return DataIngestResponse(
         success=True, message="热成像数据存储成功",
         records_stored=1, timestamp=ts,
