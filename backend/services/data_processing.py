@@ -32,6 +32,11 @@ class VibrationProcessingService:
             freq_tol=settings.SSI_STABILITY_FREQ_TOL,
             damp_tol=settings.SSI_STABILITY_DAMP_TOL,
             mac_tol=settings.SSI_STABILITY_MAC_TOL,
+            wavelet_denoise=True,
+            wavelet_name="db8",
+            wavelet_level=5,
+            wavelet_mode="soft",
+            wavelet_threshold="rigrsure",
         )
 
     async def store_vibration_batch(
