@@ -1,7 +1,11 @@
 import numpy as np
 from scipy import linalg
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from backend.algorithms.modal.wavelet_denoise import (
+    WaveletThresholdDenoiser,
+    preprocess_vibration_signal,
+)
 
 
 @dataclass
@@ -23,6 +27,11 @@ class StochasticSubspaceIdentification:
         freq_tol: float = 0.01,
         damp_tol: float = 0.05,
         mac_tol: float = 0.97,
+        wavelet_denoise: bool = True,
+        wavelet_name: str = "db8",
+        wavelet_level: int = 5,
+        wavelet_mode: str = "soft",
+        wavelet_threshold: str = "rigrsure",
     ):
         self.fs = fs
         self.order_min = order_min
@@ -30,6 +39,22 @@ class StochasticSubspaceIdentification:
         self.freq_tol = freq_tol
         self.damp_tol = damp_tol
         self.mac_tol = mac_tol
+        self.wavelet_denoise = wavelet_denoise
+        self.wavelet_name = wavelet_name
+        self.wavelet_level = wavelet_level
+        self.wavelet_mode = wavelet_mode
+        self.wavelet_threshold = wavelet_threshold
+        self._denoiser = None
+        if self.wavelet_denoise:
+            try:
+                self._denoiser = WaveletThresholdDenoiser(
+                    wavelet=self.wavelet_name,
+                    level=self.wavelet_level,
+                    mode=self.wavelet_mode,
+                    threshold_method=self.wavelet_threshold,
+                )
+            except ImportError:
+                self.wavelet_denoise = False
 
     def _hankel_matrix(self, data: np.ndarray, block_rows: int) -> np.ndarray:
         n_channels, n_samples = data.shape
@@ -151,8 +176,13 @@ class StochasticSubspaceIdentification:
                     sig = sig[:n_samples]
 
                 sig = sig - np.mean(sig)
-                sig = sig * np.hanning(len(sig))
                 data_matrix[i * 3 + axis_idx, :] = sig
+
+        if self.wavelet_denoise and self._denoiser is not None:
+            data_matrix = self._denoiser.denoise_multichannel(data_matrix)
+
+        for ch in range(data_matrix.shape[0]):
+            data_matrix[ch, :] = data_matrix[ch, :] * np.hanning(data_matrix.shape[1])
 
         poles_by_order = {}
         for order in range(self.order_min, self.order_max + 1, 4):
