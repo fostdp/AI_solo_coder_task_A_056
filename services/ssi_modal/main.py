@@ -1,5 +1,3 @@
-import logging
-import sys
 import json
 import asyncio
 import time
@@ -7,15 +5,15 @@ import numpy as np
 from datetime import datetime
 
 from shared.config import settings
+from shared.logger_setup import setup_logging
 from shared.redis_client import (
     get_redis, close_redis, xadd_msg, xread_group, ack_message, ensure_group,
 )
 from shared.database import AsyncSessionLocal
+from shared import metrics as m
 from backend.algorithms.ssi_modal import StochasticSubspaceIdentification, detect_delamination_regions
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [SSI] %(levelname)s: %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = setup_logging("ssi_modal")
 
 
 class SSIModalWorker:
@@ -38,7 +36,7 @@ class SSIModalWorker:
         consumer = f"{settings.CONSUMER_NAME}-ssi"
         await ensure_group(r, stream, group)
         self.running = True
-        logger.info("SSI模态分析Worker启动, 监听 %s", stream)
+        logger.info("SSI模态分析Worker启动, 监听 {stream}", stream=stream)
 
         while self.running:
             messages = await xread_group(r, stream, group, consumer, count=3)
@@ -50,7 +48,8 @@ class SSIModalWorker:
                     await self._process(r, msg)
                     await ack_message(r, stream, group, msg["_msg_id"])
                 except Exception as e:
-                    logger.error(f"SSI分析失败: {e}")
+                    logger.opt(exception=True).error("SSI分析失败")
+                    m.SSI_ANALYSES.labels("ssi_modal", "error").inc()
 
     async def _process(self, r, msg):
         surface_id = msg.get("surface_id", "")
@@ -71,12 +70,18 @@ class SSIModalWorker:
         t0 = time.time()
         modal_result = self.ssi.identify(vibration_data)
         processing_ms = int((time.time() - t0) * 1000)
+        m.SSI_DURATION_MS.labels("ssi_modal").observe(processing_ms / 1000.0)
+        m.SSI_ANALYSES.labels("ssi_modal", "success").inc()
 
         baseline_freqs = await self._get_baseline(surface_id)
-
         regions = detect_delamination_regions(
             modal_result, baseline_freqs, sensor_positions
         )
+        for reg in regions:
+            sev = reg.get("severity_score", 0)
+            bucket = "high" if sev > 70 else "mid" if sev > 40 else "low"
+            m.DELAMINATIONS_DETECTED.labels("ssi_modal", bucket).inc()
+            m.DELAMINATION_AREA_SQM.labels("ssi_modal", surface_id).set(float(reg.get("area_sqm", 0)))
 
         modal_payload = {
             "type": "modal_result",
@@ -101,7 +106,11 @@ class SSIModalWorker:
             await xadd_msg(r, settings.REDIS_STREAM_DELAMINATION, delam_payload)
 
         await self._store_results(surface_id, modal_result, regions, processing_ms)
-        logger.info(f"SSI完成: {surface_id} | {len(modal_result.frequencies)}模态 | {len(regions)}剥离区域 | {processing_ms}ms")
+        logger.info(
+            "SSI完成: {sid} | {n_modal}模态 | {n_reg}剥离区域 | {ms}ms",
+            sid=surface_id, n_modal=len(modal_result.frequencies),
+            n_reg=len(regions), ms=processing_ms,
+        )
 
     async def _get_baseline(self, surface_id):
         try:
@@ -154,7 +163,7 @@ class SSIModalWorker:
                     db.add(delam)
                 await db.commit()
         except Exception as e:
-            logger.error(f"结果入库失败: {e}")
+            logger.opt(exception=True).error("结果入库失败")
 
     def stop(self):
         self.running = False
