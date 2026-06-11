@@ -1,27 +1,27 @@
-import logging
-import sys
 import json
-import asyncio
+import asyncio as _aio
+import time
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config import settings
+from shared.logger_setup import setup_logging
 from shared.schemas import DiffusionSimulateRequest, DiffusionResponse
 from shared.redis_client import (
     get_redis, close_redis, xadd_msg, xread_group, ack_message, ensure_group,
 )
 from shared.database import AsyncSessionLocal
+from shared import metrics as m
+from shared.metrics import metrics_endpoint
 from backend.algorithms.grouting_diffusion import (
     NewtonianSphericalDiffusion, assess_reinforcement_effectiveness,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [GROUT] %(levelname)s: %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = setup_logging("grout_diffusion")
 
 
 class GroutDiffusionWorker:
@@ -41,7 +41,7 @@ class GroutDiffusionWorker:
         consumer = f"{settings.CONSUMER_NAME}-grout"
         await ensure_group(r, stream, group)
         self.running = True
-        logger.info("灌浆扩散Worker启动, 监听 %s", stream)
+        logger.info("灌浆扩散Worker启动, 监听 {stream}", stream=stream)
 
         while self.running:
             messages = await xread_group(r, stream, group, consumer, count=5)
@@ -53,7 +53,7 @@ class GroutDiffusionWorker:
                     await self._process(r, msg)
                     await ack_message(r, stream, group, msg["_msg_id"])
                 except Exception as e:
-                    logger.error(f"灌浆扩散处理失败: {e}")
+                    logger.opt(exception=True).error("灌浆扩散处理失败")
 
     async def _process(self, r, msg):
         task_id = msg.get("task_id", "")
@@ -65,10 +65,12 @@ class GroutDiffusionWorker:
         elapsed_seconds = int(msg.get("elapsed_seconds", "3600"))
 
         results = self.model.predict_multi_point(injection_points, elapsed_seconds, pressure_kpa)
+        m.GROUT_DIFFUSIONS.labels("grout_diffusion").inc(len(results))
 
         output = []
         for res in results:
-            item = {
+            m.GROUT_RADIUS_MM.labels("grout_diffusion", res.injection_point_id).set(res.predicted_radius_mm)
+            output.append({
                 "injection_point_id": res.injection_point_id,
                 "predicted_radius_mm": res.predicted_radius_mm,
                 "penetration_depth_mm": res.penetration_depth_mm,
@@ -77,8 +79,7 @@ class GroutDiffusionWorker:
                 "elapsed_seconds": elapsed_seconds,
                 "diffusion_front": res.diffusion_front,
                 "particle_pathlines": res.particle_pathlines,
-            }
-            output.append(item)
+            })
 
         payload = {
             "type": "grout_diffusion_result",
@@ -89,7 +90,7 @@ class GroutDiffusionWorker:
         }
         await xadd_msg(r, settings.REDIS_STREAM_GROUT_RESULTS, payload)
         await self._store_results(task_id, pressure_kpa, elapsed_seconds, results)
-        logger.info(f"灌浆扩散完成: {task_id} | {len(results)}注浆点")
+        logger.info("灌浆扩散完成: {tid} | {n}注浆点", tid=task_id, n=len(results))
 
     async def _store_results(self, task_id, pressure_kpa, elapsed_seconds, results):
         try:
@@ -115,7 +116,7 @@ class GroutDiffusionWorker:
                     db.add(gr)
                 await db.commit()
         except Exception as e:
-            logger.error(f"灌浆结果入库失败: {e}")
+            logger.opt(exception=True).error("灌浆结果入库失败")
 
     def stop(self):
         self.running = False
@@ -124,7 +125,6 @@ class GroutDiffusionWorker:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     worker = GroutDiffusionWorker()
-    import asyncio as _aio
     task = _aio.create_task(worker.run())
     logger.info("灌浆扩散服务启动 (API+Worker)")
     yield
@@ -137,9 +137,25 @@ app = FastAPI(title="Grout Diffusion Service", version="2.0.0", lifespan=lifespa
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start
+    m.API_REQUEST_DURATION.labels(
+        "grout_diffusion", request.method, request.url.path, str(response.status_code)
+    ).observe(duration)
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"service": "grout_diffusion", "status": "running"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return metrics_endpoint()
 
 
 @app.post("/simulate-diffusion", response_model=list[DiffusionResponse])
@@ -201,8 +217,8 @@ async def assess_effectiveness(task_id: str):
 
             surface_id = task.surface_id
             start_time = task.start_time or datetime.utcnow()
-            week_before = start_time - __import__("datetime").timedelta(days=7)
-            week_after = start_time + __import__("datetime").timedelta(days=7)
+            week_before = start_time - timedelta(days=7)
+            week_after = start_time + timedelta(days=7)
 
             pre_stmt = select(ModalAnalysisResult).where(
                 and_(ModalAnalysisResult.surface_id == surface_id,
