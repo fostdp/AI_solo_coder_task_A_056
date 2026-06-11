@@ -1,25 +1,25 @@
-import logging
-import sys
 import json
 import asyncio
+import time
 import numpy as np
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from shared.config import settings
+from shared.logger_setup import setup_logging
 from shared.redis_client import (
     get_redis, close_redis, xadd_msg, xread_group, ack_message, ensure_group,
 )
 from shared.database import AsyncSessionLocal
+from shared import metrics as m
+from shared.metrics import metrics_endpoint
 from backend.services.alert_push import AlertPushService
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [ALERT-WS] %(levelname)s: %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = setup_logging("alert_ws")
 
 
 class ConnectionManager:
@@ -31,11 +31,14 @@ class ConnectionManager:
         if cave_id not in self.active:
             self.active[cave_id] = set()
         self.active[cave_id].add(ws)
-        logger.info(f"WebSocket客户端连接: cave={cave_id} | 总连接数={sum(len(s) for s in self.active.values())}")
+        m.WS_CONNECTIONS.labels("alert_ws", cave_id).set(len(self.active[cave_id]))
+        logger.info("WebSocket客户端连接: cave={cave_id} | 总连接数={n}",
+                    cave_id=cave_id, n=sum(len(s) for s in self.active.values()))
 
     def disconnect(self, ws: WebSocket, cave_id: str):
         if cave_id in self.active:
             self.active[cave_id].discard(ws)
+            m.WS_CONNECTIONS.labels("alert_ws", cave_id).set(len(self.active[cave_id]))
             if not self.active[cave_id]:
                 del self.active[cave_id]
 
@@ -84,7 +87,7 @@ class AlertWorker:
                         await self._process(r, msg)
                         await ack_message(r, stream, group, msg["_msg_id"])
                     except Exception as e:
-                        logger.error(f"告警处理失败: {e}")
+                        logger.opt(exception=True).error("告警处理失败")
 
     async def _process(self, r, msg):
         msg_type = msg.get("type", "")
@@ -187,7 +190,7 @@ class AlertWorker:
                         "metrics": {"increase_pct": f"{increase_pct:.2f}%"},
                     }
         except Exception as e:
-            logger.error(f"面积告警检查失败: {e}")
+            logger.opt(exception=True).error("面积告警检查失败")
         return None
 
     async def _check_freq_alert(self, surface_id: str) -> Optional[Dict]:
@@ -238,13 +241,18 @@ class AlertWorker:
                         "metrics": {"max_drop_pct": f"{max_drop:.2f}%", "mode_order": which_mode},
                     }
         except Exception as e:
-            logger.error(f"频率告警检查失败: {e}")
+            logger.opt(exception=True).error("频率告警检查失败")
         return None
 
     async def _push_and_store(self, alert: Dict):
         try:
             channels = ["wecom", "satellite_sms"]
             push_results = await push_service.push_alert(alert, channels)
+            for ch, res in push_results.items():
+                status = "ok" if res.get("success") else "fail"
+                m.ALERT_PUSHES.labels("alert_ws", ch, status).inc()
+
+            m.ALERTS_TRIGGERED.labels("alert_ws", alert["alert_type"], alert["severity"]).inc()
 
             async with AsyncSessionLocal() as db:
                 from shared.orm_models import Alert
@@ -262,13 +270,10 @@ class AlertWorker:
                 await db.commit()
 
             cave_id = alert.get("cave_id", "C096")
-            await manager.broadcast(cave_id, {
-                "event": "alert",
-                "data": alert,
-            })
-            logger.info(f"告警推送: {alert['alert_type']} → {cave_id}")
+            await manager.broadcast(cave_id, {"event": "alert", "data": alert})
+            logger.info("告警推送: {t} → {c}", t=alert["alert_type"], c=cave_id)
         except Exception as e:
-            logger.error(f"告警推送失败: {e}")
+            logger.opt(exception=True).error("告警推送失败")
 
     def stop(self):
         self.running = False
@@ -290,9 +295,29 @@ app = FastAPI(title="Alert & WebSocket Service", version="2.0.0", lifespan=lifes
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start
+    m.API_REQUEST_DURATION.labels(
+        "alert_ws", request.method, request.url.path, str(response.status_code)
+    ).observe(duration)
+    return response
+
+
 @app.get("/health")
 async def health():
-    return {"service": "alert_ws", "status": "running", "ws_connections": sum(len(s) for s in manager.active.values())}
+    return {
+        "service": "alert_ws",
+        "status": "running",
+        "ws_connections": sum(len(s) for s in manager.active.values()),
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    return metrics_endpoint()
 
 
 @app.websocket("/ws/cave/{cave_id}")
@@ -321,8 +346,12 @@ async def list_alerts(cave_id: Optional[str] = None, limit: int = 50):
             return [
                 {
                     "alert_id": r.alert_id, "cave_id": r.cave_id,
-                    "surface_id": r.surface_id, "alert_type": r.alert_type,
-                    "severity": r.severity, "message": r.message,
+                    "cave_id": r.cave_id,
+                    "surface_id": r.surface_id,
+                    "alert_id_real": r.alert_id,
+                    "alert_type": r.alert_type,
+                    "severity": r.severity,
+                    "message": r.message,
                     "status": r.status,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
