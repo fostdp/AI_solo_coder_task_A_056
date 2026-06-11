@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { FlowLineManager } from './flow_lines.js';
 
 const API_BASE = '/api/v1';
 
@@ -20,6 +21,7 @@ class MogaoCaveVisualizer {
         this.delaminationMeshes = [];
         this.diffusionMeshes = [];
         this.streamlineObjects = [];
+        this.flowLineMgr = null;
         this.animationIds = new Map();
         this.currentCaveId = null;
         this.currentCaveData = null;
@@ -69,6 +71,7 @@ class MogaoCaveVisualizer {
         this.setupLights();
         this.scene.add(this.caveGroup);
         this.addGridFloor();
+        this.flowLineMgr = new FlowLineManager(this.scene);
         this.animate();
     }
 
@@ -154,11 +157,7 @@ class MogaoCaveVisualizer {
             }
         });
         this.diffusionMeshes = [];
-        this.streamlineObjects.forEach(o => {
-            this.caveGroup.remove(o);
-            if (o.geometry) o.geometry.dispose();
-            if (o.material) o.material.dispose();
-        });
+        if (this.flowLineMgr) this.flowLineMgr.clearAll();
         this.streamlineObjects = [];
         this.animationIds.forEach(id => cancelAnimationFrame(id));
         this.animationIds.clear();
@@ -216,6 +215,7 @@ class MogaoCaveVisualizer {
             totalArea += w.w * w.h;
         });
         this.addFrameStructure(W, H, L);
+        let allPathlines = [];
         caveData.walls.forEach(wall => {
             (wall.vibration_sensors || []).forEach(s => this.addVibrationSensor(s));
             (wall.thermal_cameras || []).forEach(c => this.addThermalCamera(c));
@@ -225,12 +225,17 @@ class MogaoCaveVisualizer {
                     (task.injection_points || []).forEach(ip => {
                         if (ip.id === diff.injection_point_id) {
                             this.addDiffusionSphere(task.task_id, ip, diff);
-                            if (diff.particle_pathlines) this.addStreamlines(ip, diff.particle_pathlines);
+                            if (diff.particle_pathlines) {
+                                allPathlines = allPathlines.concat(diff.particle_pathlines);
+                            }
                         }
                     });
                 });
             });
         });
+        if (allPathlines.length > 0 && this.flowLineMgr) {
+            this.flowLineMgr.addStreamlines(allPathlines);
+        }
         document.getElementById('caveArea').textContent = `${totalArea.toFixed(1)} m²`;
         const cx = W/2, cy = H/2, cz = L/2;
         const maxDim = Math.max(L, W, H);
@@ -439,56 +444,11 @@ class MogaoCaveVisualizer {
     }
 
     addStreamlines(ip, pathlines) {
-        if (!this.settings.showStreamlines) return;
-        pathlines.forEach(line => {
-            const pts = line.points || [];
-            if (pts.length < 2) return;
-            const curvePts = pts.map(p => new THREE.Vector3(p.x, p.y, p.z));
-            const curve = new THREE.CatmullRomCurve3(curvePts);
-            const curvePoints = curve.getPoints(60);
-            const geo = new THREE.BufferGeometry().setFromPoints(curvePoints);
-            const n = curvePoints.length;
-            const colors = new Float32Array(n * 3);
-            for (let i = 0; i < n; i++) {
-                const t = i / (n-1);
-                colors[i*3] = 0.05 + t*0.5;
-                colors[i*3+1] = 0.75 + t*0.1;
-                colors[i*3+2] = 0.9 - t*0.1;
-            }
-            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-            const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.7 });
-            const lineObj = new THREE.Line(geo, mat);
-            lineObj.userData = { type: 'streamline', lineData: line };
-            this.caveGroup.add(lineObj);
-            this.streamlineObjects.push(lineObj);
-            this.createFlowingParticles(curve, line.streamline_id);
-        });
+        if (!this.settings.showStreamlines || !this.flowLineMgr) return;
+        this.flowLineMgr.addStreamlines(pathlines);
     }
 
     createFlowingParticles(curve, id) {
-        const nParticles = 5;
-        const particles = [];
-        for (let i = 0; i < nParticles; i++) {
-            const geo = new THREE.SphereGeometry(0.012, 10, 10);
-            const mat = new THREE.MeshBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.9 });
-            const p = new THREE.Mesh(geo, mat);
-            p.userData.offset = i / nParticles;
-            this.caveGroup.add(p);
-            particles.push(p);
-            this.streamlineObjects.push(p);
-        }
-        let t = 0;
-        const animate = () => {
-            t += 0.003;
-            particles.forEach(p => {
-                const pos = (t + p.userData.offset) % 1;
-                curve.getPoint(pos, p.position);
-                p.material.opacity = 0.3 + 0.6 * Math.sin(pos * Math.PI);
-                p.scale.setScalar(0.5 + 0.8 * Math.sin(pos * Math.PI));
-            });
-            this.animationIds.set(`fl_${id}`, requestAnimationFrame(animate));
-        };
-        animate();
     }
 
     updateDelaminationSettings() {
@@ -501,7 +461,7 @@ class MogaoCaveVisualizer {
 
     updateDiffusionSettings() {
         this.diffusionMeshes.forEach(m => m.visible = this.settings.showDiffusion);
-        this.streamlineObjects.forEach(o => o.visible = this.settings.showStreamlines && this.settings.showDiffusion);
+        if (this.flowLineMgr) this.flowLineMgr.setVisible(this.settings.showStreamlines && this.settings.showDiffusion);
     }
 
     bindEvents() {
@@ -950,6 +910,7 @@ class MogaoCaveVisualizer {
             const flash = Math.sin(Date.now()*0.004 + i) > 0.7;
             c.children[1] && (c.children[1].material.emissiveIntensity = flash ? 1.2 : 0.4);
         });
+        if (this.flowLineMgr) this.flowLineMgr.update(Date.now() * 0.001);
         this.renderer.render(this.scene, this.camera);
     }
 }
