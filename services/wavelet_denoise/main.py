@@ -1,18 +1,16 @@
-import logging
-import sys
 import json
 import asyncio
 import numpy as np
 
 from shared.config import settings
+from shared.logger_setup import setup_logging
 from shared.redis_client import (
     get_redis, close_redis, xadd_msg, xread_group, ack_message, ensure_group,
 )
+from shared import metrics as m
 from backend.algorithms.modal.wavelet_denoise import WaveletThresholdDenoiser
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [WAVELET] %(levelname)s: %(message)s",
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = setup_logging("wavelet_denoise")
 
 
 class WaveletDenoiseWorker:
@@ -32,7 +30,7 @@ class WaveletDenoiseWorker:
         consumer = f"{settings.CONSUMER_NAME}-wavelet"
         await ensure_group(r, stream, group)
         self.running = True
-        logger.info("小波去噪Worker启动, 监听 %s", stream)
+        logger.info("小波去噪Worker启动, 监听 {stream}", stream=stream)
 
         while self.running:
             messages = await xread_group(r, stream, group, consumer, count=5)
@@ -44,7 +42,7 @@ class WaveletDenoiseWorker:
                     await self._process(r, msg)
                     await ack_message(r, stream, group, msg["_msg_id"])
                 except Exception as e:
-                    logger.error(f"去噪处理失败: {e}")
+                    logger.opt(exception=True).error("去噪处理失败")
 
     async def _process(self, r, msg):
         msg_type = msg.get("type", "")
@@ -78,7 +76,8 @@ class WaveletDenoiseWorker:
             "sensors": json.dumps(denoised_sensors),
         }
         await xadd_msg(r, settings.REDIS_STREAM_VIBRATION_DENOISED, payload)
-        logger.info(f"去噪完成: {surface_id} | {len(denoised_sensors)}传感器")
+        m.DENOISE_BATCHES.labels("wavelet_denoise").inc()
+        logger.info("去噪完成: {sid} | {n}传感器", sid=surface_id, n=len(denoised_sensors))
 
     def stop(self):
         self.running = False
